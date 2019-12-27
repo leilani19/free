@@ -1,0 +1,347 @@
+apply plugin: 'com.android.application'
+apply plugin: 'io.fabric'
+apply plugin: 'com.google.firebase.firebase-perf'
+apply from: '../config/quality.gradle'
+apply from: '../config/jacoco.gradle'
+
+import com.android.ddmlib.DdmPreferences
+
+DdmPreferences.setTimeOut(60000)
+
+ant.condition(property: 'os', value: 'windows') {
+    os(family: 'windows')
+}
+ant.condition(property: 'os', value: 'unix') {
+    os(family: 'unix')
+}
+
+// Build numbers were manually set until 1067
+def LEGACY_BUILD_NUMBER_OFFSET = 1067
+
+// Based on http://stackoverflow.com/questions/17097263#24121734
+def getMasterCommitCount = { ->
+    try {
+        def stdout = new ByteArrayOutputStream()
+        exec {
+            switch (ant.properties.os) {
+                case 'windows':
+                    commandLine 'cmd', '/c', 'git', 'rev-list', '--first-parent', '--count', 'master'
+                    break
+                case 'unix':
+                    commandLine 'git', 'rev-list', '--first-parent', '--count', 'master'
+                    break
+            }
+            standardOutput = stdout
+        }
+        return Integer.parseInt(stdout.toString().trim())
+    } catch (ignored) {
+        return -1
+    }
+}
+
+def getVersionName = { ->
+    try {
+        def stdout = new ByteArrayOutputStream()
+        exec {
+            switch (ant.properties.os) {
+                case 'windows':
+                    commandLine 'cmd', '/c', 'git', 'describe', '--tags', '--dirty', '--always'
+                    break
+                case 'unix':
+                    commandLine 'git', 'describe', '--tags', '--dirty', '--always'
+                    break
+            }
+            standardOutput = stdout
+        }
+        return stdout.toString().trim()
+    } catch (ignored) {
+        return null
+    }
+}
+
+def secretsFile = file('secrets.properties')
+def secrets = new Properties()
+if (secretsFile.exists()) {
+    secrets.load(new FileInputStream(secretsFile))
+}
+def googleMapsApiKey = secrets.getProperty('GOOGLE_MAPS_API_KEY', '')
+def mapboxToken = secrets.getProperty('MAPBOX_ACCESS_TOKEN', '')
+
+android {
+    compileSdkVersion(28)
+
+    defaultConfig {
+        applicationId('org.odk.collect.android')
+        minSdkVersion(16)
+        targetSdkVersion(28)
+        versionCode LEGACY_BUILD_NUMBER_OFFSET + getMasterCommitCount()
+        versionName getVersionName()
+        testInstrumentationRunner('androidx.test.runner.AndroidJUnitRunner')
+        multiDexEnabled true
+        vectorDrawables.useSupportLibrary = true
+        archivesBaseName = 'collect'
+    }
+
+    signingConfigs {
+        release {
+            if (secrets.getProperty('RELEASE_STORE_FILE')) {
+                storeFile file(secrets.getProperty('RELEASE_STORE_FILE'))
+                storePassword secrets.getProperty('RELEASE_STORE_PASSWORD')
+                keyAlias secrets.getProperty('RELEASE_KEY_ALIAS')
+                keyPassword secrets.getProperty('RELEASE_KEY_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        // Release build for all forks
+        release {
+            if (secrets.getProperty('RELEASE_STORE_FILE')) {
+                signingConfig signingConfigs.release
+            }
+            minifyEnabled(true)
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.txt'
+            resValue("bool", "CRASHLYTICS_ENABLED", "false")
+            resValue("string", "GOOGLE_MAPS_API_KEY", googleMapsApiKey)
+            buildConfigField 'String', "MAPBOX_ACCESS_TOKEN", '"' + mapboxToken + '"'
+        }
+        // Release build for the official ODK Collect app
+        odkCollectRelease {
+            if (secrets.getProperty('RELEASE_STORE_FILE')) {
+                signingConfig signingConfigs.release
+            }
+            minifyEnabled(true)
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.txt'
+            resValue("bool", "CRASHLYTICS_ENABLED", "true")
+            resValue("string", "GOOGLE_MAPS_API_KEY", googleMapsApiKey)
+            buildConfigField 'String', "MAPBOX_ACCESS_TOKEN", '"' + mapboxToken + '"'
+        }
+        debug {
+            debuggable(true)
+            testCoverageEnabled(true)
+            resValue("bool", "CRASHLYTICS_ENABLED", "false")
+            resValue("string", "GOOGLE_MAPS_API_KEY", googleMapsApiKey)
+            buildConfigField 'String', "MAPBOX_ACCESS_TOKEN", '"' + mapboxToken + '"'
+        }
+    }
+
+    // https://stackoverflow.com/a/27119543/152938
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = new File(outputFileName.replace(".apk", "-${defaultConfig.versionName}.apk"))
+        }
+    }
+    testVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = new File(outputFileName.replace(".apk", "-${defaultConfig.versionName}.apk"))
+        }
+    }
+
+    packagingOptions {
+        // Pick first occurrence of any files that cause conflicts, as defined
+        // in common.gradle
+        pickFirst 'META-INF/DEPENDENCIES'
+        pickFirst 'META-INF/LICENSE'
+        pickFirst 'META-INF/LICENSE.txt'
+        pickFirst 'META-INF/NOTICE'
+        pickFirst 'META-INF/NOTICE.txt'
+        pickFirst 'META-INF/services/com.fasterxml.jackson.core.JsonFactory'
+        pickFirst 'META-INF/services/com.fasterxml.jackson.core.ObjectCodec'
+        pickFirst 'META-INF/services/javax.ws.rs.ext.MessageBodyReader'
+        pickFirst 'META-INF/services/javax.ws.rs.ext.MessageBodyWriter'
+
+        // To ensure that ODK Collect is installable on all devices, we don't use
+        // abiFilters to exclude any ABIs; but to keep the APK slim, we include
+        // the Mapbox native library only for 32-bit and 64-bit ARM devices and
+        // omit it for all X86 devices.
+        exclude 'lib/x86/libmapbox-gl.so'
+        exclude 'lib/x86_64/libmapbox-gl.so'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    dexOptions {
+        javaMaxHeapSize '2048M'
+    }
+
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+            returnDefaultValues = true
+            all {
+                // https://discuss.circleci.com/t/11207/24
+                // it seems any number works, but 1024 - 2048 seem reasonable
+                maxHeapSize = "2048M"
+            }
+        }
+    }
+}
+
+configurations.all {
+    resolutionStrategy {
+        cacheDynamicVersionsFor(0, 'seconds')
+        cacheChangingModulesFor(0, 'seconds')
+
+        force('com.google.code.findbugs:jsr305:1.3.9')
+    }
+    transitive = true
+}
+
+dependencies {
+    // To make ODK Collect is installable on all devices even though the Mapbox
+    // native library is missing for some ABIs, we include an .aar dependency
+    // named "nbi-stubs", which causes there to be at least one .so library
+    // present for every ABI (armeabi, armeabi-v7a, arm64-v8a, x86, x86_64).
+    implementation fileTree(dir: 'libs', include: ['*.jar', '*.aar'])
+
+    implementation 'androidx.legacy:legacy-support-v13:1.0.0'
+    implementation 'androidx.browser:browser:1.2.0'
+    implementation 'androidx.appcompat:appcompat:1.1.0-rc01' // Shouldn't be upgraded until https://issuetracker.google.com/issues/141869006 is fixed
+    implementation 'com.google.android.material:material:1.1.0-alpha10'
+    implementation 'androidx.cardview:cardview:1.0.0'
+    implementation 'androidx.exifinterface:exifinterface:1.1.0'
+    implementation "androidx.multidex:multidex:2.0.1"
+
+    implementation "com.google.android.gms:play-services-auth:17.0.0"
+    implementation "com.google.android.gms:play-services-maps:17.0.0"
+    implementation "com.google.android.gms:play-services-location:17.0.0"
+
+    implementation 'com.google.firebase:firebase-perf:19.0.4'
+    implementation 'com.google.firebase:firebase-analytics:17.2.1'
+    implementation "com.crashlytics.sdk.android:crashlytics:2.10.1"
+
+    implementation 'com.mapbox.mapboxsdk:mapbox-android-sdk:8.6.0'
+    implementation 'com.mapbox.mapboxsdk:mapbox-android-plugin-annotation-v7:0.6.0'
+
+    implementation("com.google.guava:guava:28.1-android")
+
+    implementation "com.squareup.okhttp3:okhttp:${rootProject.okhttp3Version}"
+    implementation 'com.burgstaller:okhttp-digest:1.18' //newer versions require minSdkVersion >= 21
+
+    implementation 'com.github.mohamadian:PersianJodaTime:1.2'
+    implementation 'com.github.chanmratekoko:myanmar-calendar:1.0.6.RC3'
+    implementation 'bikramsambat:bikram-sambat:1.1.0'
+    implementation "com.evernote:android-job:1.4.2"
+    implementation "com.rarepebble:colorpicker:3.0.1"
+    implementation "commons-io:commons-io:2.6"
+    implementation "net.sf.opencsv:opencsv:2.4"
+    implementation("org.opendatakit:opendatakit-javarosa:2.17.0") {
+        exclude group: 'joda-time'
+        exclude group: 'org.slf4j'
+    }
+    implementation "com.karumi:dexter:6.0.1"
+    implementation "org.osmdroid:osmdroid-android:5.6.4"
+    implementation("com.google.api-client:google-api-client-android:1.30.7") {
+        exclude group: 'org.apache.httpcomponents'
+        exclude group: 'com.google.guava'
+    }
+    implementation("com.google.apis:google-api-services-drive:v3-rev20191108-1.30.3") {
+        exclude group: 'org.apache.httpcomponents'
+        exclude group: 'com.google.guava'
+    }
+    implementation("com.google.apis:google-api-services-sheets:v4-rev20191213-1.30.3") {
+        exclude group: 'org.apache.httpcomponents'
+        exclude group: 'com.google.guava'
+    }
+
+    implementation "com.jakewharton.timber:timber:4.7.1"
+    implementation "org.slf4j:slf4j-api:2.0.0-alpha0"
+    implementation "com.arcao:slf4j-timber:3.1@aar"
+
+    implementation "com.google.zxing:core:3.3.0" //updating to 3.4.0 requires minSdkVersion >=24 https://github.com/zxing/zxing/releases/tag/zxing-3.4.0
+    implementation "com.journeyapps:zxing-android-embedded:3.5.0" //updating would require minSdkVersion >=24
+    implementation "net.danlew:android.joda:2.10.3"
+
+    // Real LeakCanary for debug builds only: notifications, analysis, etc
+    debugImplementation "com.squareup.leakcanary:leakcanary-android:${rootProject.leakyCanaryVersion}"
+    // No-Op version of LeakCanary for release builds: no notifications, no analysis, nothing
+    releaseImplementation "com.squareup.leakcanary:leakcanary-android-no-op:${rootProject.leakyCanaryVersion}"
+    testImplementation "com.squareup.leakcanary:leakcanary-android-no-op:${rootProject.leakyCanaryVersion}"
+    androidTestImplementation "com.squareup.leakcanary:leakcanary-android-no-op:${rootProject.leakyCanaryVersion}"
+    odkCollectReleaseImplementation "com.squareup.leakcanary:leakcanary-android-no-op:${rootProject.leakyCanaryVersion}"
+
+    // Android Architecture Components:
+    implementation "androidx.lifecycle:lifecycle-extensions:2.1.0"
+
+    // Dagger:
+    implementation "com.google.dagger:dagger:${rootProject.daggerVersion}"
+    annotationProcessor "com.google.dagger:dagger-compiler:${rootProject.daggerVersion}"
+    testAnnotationProcessor "com.google.dagger:dagger-compiler:${rootProject.daggerVersion}" // Needed for injection into Robolectric tests
+
+    // Dagger Android:
+    implementation "com.google.dagger:dagger-android:${rootProject.daggerVersion}"
+    implementation "com.google.dagger:dagger-android-support:${rootProject.daggerVersion}"
+    annotationProcessor "com.google.dagger:dagger-android-processor:${rootProject.daggerVersion}"
+
+    // RxJava 2:
+    implementation "io.reactivex.rxjava2:rxandroid:2.1.1"
+    implementation "io.reactivex.rxjava2:rxjava:2.2.16"
+
+    // Better "Subjects" for Rx:
+    implementation "com.jakewharton.rxrelay2:rxrelay:2.1.1"
+
+    // WorkManager for specifying deferrable, asynchronous tasks
+    implementation("android.arch.work:work-runtime:1.0.1") {
+        exclude group: 'com.google.guava', module: 'listenablefuture'
+    }
+    // Optional JobDispatcher support so devices with Play Services do better than AlarmManager
+    implementation("android.arch.work:work-firebase:1.0.0-alpha11") {
+        exclude group: 'com.google.guava', module: 'listenablefuture'
+    }
+
+    // Makes binding to Views easy:
+    implementation "com.jakewharton:butterknife:10.2.1"
+    annotationProcessor "com.jakewharton:butterknife-compiler:10.2.1"
+
+    // Annotations understood by FindBugs
+    compileOnly 'com.google.code.findbugs:annotations:3.0.1'
+    compileOnly 'com.google.code.findbugs:jsr305:3.0.2'
+
+    // Used to generate documentation screenshots.
+    androidTestImplementation "tools.fastlane:screengrab:1.1.0" //updating would require minSdkVersion >=18
+
+    // Testing-only dependencies
+    testImplementation "junit:junit:4.13-beta-3"
+    testImplementation "org.mockito:mockito-core:3.2.4"
+
+    testImplementation "org.robolectric:robolectric:4.3.1"
+    testImplementation "org.robolectric:shadows-multidex:4.3.1"
+    testImplementation "com.squareup.okhttp3:mockwebserver:${rootProject.okhttp3Version}"
+    testImplementation "com.squareup.okhttp3:okhttp-tls:${rootProject.okhttp3Version}"
+
+    // power mock (for mocking final methods which is not handled by mockito)
+    testImplementation "org.powermock:powermock-module-junit4:2.0.4"
+    testImplementation "org.powermock:powermock-api-mockito2:2.0.4"
+
+    testImplementation "androidx.arch.core:core-testing:2.1.0"
+
+    testImplementation "org.json:json:20190722"
+
+    androidTestImplementation "org.mockito:mockito-android:3.2.4"
+    androidTestImplementation("androidx.test:runner:1.3.0-alpha02") {
+        exclude group: 'com.android.support', module: 'support-annotations'
+        exclude group: 'com.google.code.findbugs', module: 'jsr305'
+    }
+
+    androidTestImplementation 'androidx.test.ext:junit:1.1.1'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.2.0'
+    androidTestImplementation 'androidx.test.espresso:espresso-contrib:3.2.0'
+    androidTestImplementation("androidx.test.espresso:espresso-intents:3.2.0") {
+        exclude group: 'com.android.support', module: 'support-annotations'
+        exclude group: 'com.google.code.findbugs', module: 'jsr305'
+    }
+
+    androidTestImplementation "com.squareup.okhttp3:mockwebserver:${rootProject.okhttp3Version}"
+
+    androidTestImplementation "android.arch.work:work-testing:1.0.1"
+}
+
+// Must be at bottom to prevent dependency collisions
+// https://developers.google.com/android/guides/google-services-plugin
+apply plugin: 'com.google.gms.google-services'
+
+
+

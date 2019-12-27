@@ -1,0 +1,46 @@
+build
+.gradle
+.idea
+local.properties
+*.iml
+.DS_Store
+*.sublime-project
+
+# emacs backup files
+*.*~
+
+# gradle env props
+secrets.properties
+
+# built application files
+*.apk
+*.ap_
+
+# files for the Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+
+# Android Studio files
+.externalNativeBuild/
+.navigation/
+captures/
+
+# Visual Studio Code files
+.project
+.settings/
+collect_app/.classpath
+collect_app/.project
+collect_app/.settings/
+
+# Submodules
+javarosa/
+
+# Config for the official ODK Collect build
+collect_app/src/odkCollectRelease/
